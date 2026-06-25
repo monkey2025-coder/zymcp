@@ -4,8 +4,11 @@ from pydantic import BaseModel, ConfigDict, Field, FileUrl, TypeAdapter
 from pydantic.alias_generators import to_camel
 import asyncio
 import inspect
-from fastapi import FastAPI, APIRouter, HTTPException
 import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.routing import Route, Mount
 
 from zymcp_tool import extract_input_schema, extract_return_annotation, get_json_type
 from zymcp_type import Tool, JSONRPCResponse, RequestId, MCPModel, BaseMetadata, Meta, _CallableT
@@ -73,108 +76,83 @@ class zymcp:
             )
         return jsonrpc_response
 
-    def _create_mcp_router(self) -> APIRouter:
-        router = APIRouter()
-        
-        @router.get("/")
-        async def get_mcp():
-            return {
+    def _create_mcp_router(self) -> list:
+        async def get_mcp(request: Request):
+            return JSONResponse({
                 "name": "MCP Server",
                 "protocolVersion": "2025-11-25",
                 "capabilities": {
                     "tools": {}
                 }
-            }
-        
-        @router.post("/")
-        async def post_mcp(request: dict[str, Any]):
-            method = request.get("method")
-            request_id = request.get("id")
-            jsonrpc_version = request.get("jsonrpc", "2.0")
+            })
+
+        async def post_mcp(request: Request):
+            body = await request.json()
+            method = body.get("method")
+            request_id = body.get("id")
+            jsonrpc_version = body.get("jsonrpc", "2.0")
+            
+            result = {}
             
             if not method:
-                return JSONRPCResponse(
-                    jsonrpc=jsonrpc_version,
-                    id=request_id,
-                    result={"error": {"code": -32600, "message": "Missing 'method' in request"}}
-                )
-            
-            if method == "initialize":
-                params = request.get("params", {})
-                client_protocol_version = params.get("protocolVersion", "")
-                
-                return JSONRPCResponse(
-                    jsonrpc=jsonrpc_version,
-                    id=request_id,
-                    result={
-                        "protocolVersion": "2025-11-25",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "zymcp",
-                            "version": "1.0.0",
-                            "title": "ZY MCP Server",
-                            "description": "A Model Context Protocol server implementation"
-                        }
+                result = {"error": {"code": -32600, "message": "Missing 'method' in request"}}
+            elif method == "initialize":
+                result = {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "zymcp",
+                        "version": "1.0.0",
+                        "title": "ZY MCP Server",
+                        "description": "A Model Context Protocol server implementation"
                     }
-                )
-            
+                }
             elif method == "tools/list":
                 tools = await self.list_tools()
-                return JSONRPCResponse(
-                    jsonrpc=jsonrpc_version,
-                    id=request_id,
-                    result={
-                        "tools": [tool.model_dump(by_alias=True) for tool in tools]
-                    }
-                )
-            
+                result = {
+                    "tools": [tool.model_dump(by_alias=True) for tool in tools]
+                }
             elif method == "tools/call":
-                params = request.get("params", {})
+                params = body.get("params", {})
                 tool_name = params.get("name")
                 
                 if not tool_name:
-                    return JSONRPCResponse(
-                        jsonrpc=jsonrpc_version,
-                        id=request_id,
-                        result={"error": {"code": -32602, "message": "Missing tool name"}}
-                    )
-                
-                if tool_name not in self.tools:
-                    return JSONRPCResponse(
-                        jsonrpc=jsonrpc_version,
-                        id=request_id,
-                        result={"error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}}
-                    )
-                
-                arguments = params.get("arguments", {})
-                tool_info = self.tools[tool_name]
-                fn = tool_info["fn"]
-                
-                try:
-                    if asyncio.iscoroutinefunction(fn):
-                        result = await fn(**arguments)
-                    else:
-                        result = fn(**arguments)
+                    result = {"error": {"code": -32602, "message": "Missing tool name"}}
+                elif tool_name not in self.tools:
+                    result = {"error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}}
+                else:
+                    arguments = params.get("arguments", {})
+                    tool_info = self.tools[tool_name]
+                    fn = tool_info["fn"]
                     
-                    return JSONRPCResponse(
-                        jsonrpc=jsonrpc_version,
-                        id=request_id,
-                        result={"result": result}
-                    )
-                except Exception as e:
-                    return JSONRPCResponse(
-                        jsonrpc=jsonrpc_version,
-                        id=request_id,
-                        result={"error": {"code": -32000, "message": str(e)}}
-                    )
+                    try:
+                        if asyncio.iscoroutinefunction(fn):
+                            call_result = await fn(**arguments)
+                        else:
+                            call_result = fn(**arguments)
+                        
+                        result = {"result": call_result}
+                    except Exception as e:
+                        result = {"error": {"code": -32000, "message": str(e)}}
             else:
-                return JSONRPCResponse(
-                    jsonrpc=jsonrpc_version,
-                    id=request_id,
-                    result={"error": {"code": -32601, "message": f"Unknown method: {method}"}}
-                )
+                result = {"error": {"code": -32601, "message": f"Unknown method: {method}"}}
+            
+            response = JSONRPCResponse(
+                jsonrpc=jsonrpc_version,
+                id=request_id,
+                result=result
+            )
+            
+            return JSONResponse(response.model_dump(by_alias=True))
+        
+        router = [
+            Mount('/mcp', routes=[
+                Route('/', get_mcp, methods=['GET']),
+                Route('/', post_mcp, methods=['POST']),
+            ]),
+        ]
         
         return router
 
@@ -184,13 +162,14 @@ class zymcp:
         port: int = 8000,
         **kwargs
     ):
-        app = FastAPI(title="MCP Server", version="1.0.0")
         mcp_router = self._create_mcp_router()
-        app.mount("/mcp", mcp_router)
+
+        async def root(request: Request):
+            return JSONResponse({"message": "MCP Server is running", "mcp": "/mcp"})
         
-        @app.get("/")
-        async def root():
-            return {"message": "MCP Server is running", "docs": "/docs", "mcp": "/mcp"}
+        app = Starlette(debug=True, routes=[
+            Route('/', root),
+        ] + mcp_router)
         
         uvicorn.run(app, host=host, port=port, **kwargs)
 
